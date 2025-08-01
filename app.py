@@ -1,136 +1,129 @@
 import streamlit as st
-import pandas as pd
-import numpy as np
 import yfinance as yf
+import pandas as pd
 import ta
-from ta.momentum import RSIIndicator, StochasticOscillator
-from ta.trend import MACD
-from ta.volatility import BollingerBands
-import altair as alt
 
 st.set_page_config(layout="wide")
 st.title("📊 SPX Multi-Indicator Market Score Dashboard")
 
 @st.cache_data(ttl=300)
 def fetch_data(ticker, period="6mo", interval="1d"):
-    df = yf.download(ticker, period=period, interval=interval, progress=False)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(-1)
-    df.dropna(how='all', inplace=True)
-    return df
+    try:
+        df = yf.download(ticker, period=period, interval=interval, progress=False)
+        if df.empty:
+            st.warning(f"⚠️ Nem érkeztek adatok a {ticker} tickerhez.")
+            return pd.DataFrame()
+        return df
+    except Exception as e:
+        st.error(f"Adatlekérés hiba a {ticker} esetén: {e}")
+        return pd.DataFrame()
 
+# SPX adat
 spx = fetch_data("^GSPC")
-vix = fetch_data("^VIX")
 
-price_col = "Adj Close" if "Adj Close" in spx.columns else "Close"
-vix_price_col = "Adj Close" if "Adj Close" in vix.columns else "Close"
-
-if spx.empty or price_col not in spx.columns:
-    st.error("❌ SPX adatok nem érhetők el vagy hiányzik az árfolyam oszlop.")
+# Debug: mutatjuk az oszlopokat, ha jön adat
+if not spx.empty:
+    st.write("SPX oszlopok:", spx.columns.tolist())
+else:
+    st.error("❌ SPX adatok nem érhetők el.")
     st.stop()
 
-if vix.empty or vix_price_col not in vix.columns:
-    st.warning("⚠️ VIX adat nem érhető el vagy hiányzik az árfolyam oszlop.")
+# VIX adat
+vix = fetch_data("^VIX")
 
-price_series = spx[price_col].dropna()
+if not vix.empty:
+    st.write("VIX oszlopok:", vix.columns.tolist())
+else:
+    st.warning("⚠️ VIX adatok nem érhetők el.")
 
+# Megnézzük, van-e Close vagy Adj Close az SPX-ben
+price_col = None
+for col in ['Adj Close', 'Close']:
+    if col in spx.columns:
+        price_col = col
+        break
+
+if price_col is None:
+    st.error("❌ Nem található 'Close' vagy 'Adj Close' oszlop az SPX adatok között.")
+    st.stop()
+
+# Indikátorok számítása (ha adatok megvannak)
 try:
-    rsi = RSIIndicator(close=price_series, window=14).rsi()
-    spx.loc[rsi.index, "RSI"] = rsi
+    # Drawdown
+    spx['Drawdown'] = (spx[price_col] / spx[price_col].cummax()) - 1
+
+    # RSI
+    spx['RSI'] = ta.momentum.RSIIndicator(spx[price_col], window=14).rsi()
+
+    # SMA 50, 200
+    spx['SMA50'] = spx[price_col].rolling(window=50).mean()
+    spx['SMA200'] = spx[price_col].rolling(window=200).mean()
+
+    # MACD
+    macd = ta.trend.MACD(spx[price_col])
+    spx['MACD'] = macd.macd()
+    spx['MACD_signal'] = macd.macd_signal()
+
+    # Bollinger Bands
+    bollinger = ta.volatility.BollingerBands(spx[price_col])
+    spx['BB_upper'] = bollinger.bollinger_hband()
+    spx['BB_lower'] = bollinger.bollinger_lband()
+
+    # Stochastic Oscillator
+    stoch = ta.momentum.StochasticOscillator(spx['High'], spx['Low'], spx[price_col])
+    spx['Stoch'] = stoch.stoch()
+    
 except Exception as e:
-    st.error(f"RSI számítás hiba: {e}")
-    spx["RSI"] = np.nan
+    st.error(f"Hiba az indikátorok számításakor: {e}")
+    st.stop()
 
-try:
-    macd_indicator = MACD(close=price_series)
-    spx.loc[price_series.index, "MACD"] = macd_indicator.macd()
-    spx.loc[price_series.index, "MACD_signal"] = macd_indicator.macd_signal()
+# Egyszerű pontozás az indikátorok alapján (max 6 pont)
+spx['Buy_Score'] = (
+    ((spx['RSI'] < 30).astype(int)) +
+    ((spx['Drawdown'] < -0.10).astype(int)) +  # nagyobb drawdown = jobb vételi pont
+    ((spx['MACD'] > spx['MACD_signal']).astype(int)) +  # bullish MACD crossover
+    ((spx['SMA50'] > spx['SMA200']).astype(int)) +  # golden cross
+    ((spx[price_col] < spx['BB_lower']).astype(int)) +  # ár a Bollinger alsó szalag alatt
+    ((spx['Stoch'] < 20).astype(int))  # stochastic oversold
+)
 
-    bollinger = BollingerBands(close=price_series)
-    spx.loc[price_series.index, "BB_high"] = bollinger.bollinger_hband()
-    spx.loc[price_series.index, "BB_low"] = bollinger.bollinger_lband()
+spx['Sell_Score'] = (
+    ((spx['RSI'] > 70).astype(int)) +
+    ((spx['Drawdown'] > -0.01).astype(int)) +
+    ((spx['MACD'] < spx['MACD_signal']).astype(int)) +
+    ((spx['SMA50'] < spx['SMA200']).astype(int)) +
+    ((spx[price_col] > spx['BB_upper']).astype(int)) +
+    ((spx['Stoch'] > 80).astype(int))
+)
 
-    stoch = StochasticOscillator(high=spx["High"], low=spx["Low"], close=price_series)
-    spx.loc[price_series.index, "Stoch"] = stoch.stoch()
-
-except Exception as e:
-    st.error(f"Technikai indikátor számítás hiba: {e}")
-
-# OBV manuális számítása
-def calculate_obv(close, volume):
-    obv = [0]
-    for i in range(1, len(close)):
-        if close.iloc[i] > close.iloc[i-1]:
-            obv.append(obv[-1] + volume.iloc[i])
-        elif close.iloc[i] < close.iloc[i-1]:
-            obv.append(obv[-1] - volume.iloc[i])
-        else:
-            obv.append(obv[-1])
-    return pd.Series(obv, index=close.index)
-
-spx['OBV'] = calculate_obv(spx[price_col], spx['Volume'])
-
-spx["Drawdown"] = spx[price_col] / spx[price_col].cummax() - 1
-
-vix_current = None
-vix_trend_falling = False
-if not vix.empty and vix_price_col in vix.columns:
-    vix_current = vix[vix_price_col].iloc[-1]
-    vix_diff = vix[vix_price_col].diff().dropna()
-    vix_trend_falling = vix_diff.iloc[-5:].mean() < 0
-
-spx["Buy_Score"] = 0
-spx["Sell_Score"] = 0
-
-spx.loc[price_series.index, "Buy_Score"] += (spx["RSI"] < 30).astype(int)
-spx.loc[price_series.index, "Buy_Score"] += (spx["Drawdown"] < -0.10).astype(int)
-spx.loc[price_series.index, "Buy_Score"] += (vix_current is not None and (vix_current > 25 and vix_trend_falling)).astype(int)
-spx.loc[price_series.index, "Buy_Score"] += ((spx["MACD"] > spx["MACD_signal"]).astype(int))
-spx.loc[price_series.index, "Buy_Score"] += ((spx["Stoch"] < 20).astype(int))
-spx.loc[price_series.index, "Buy_Score"] += ((spx["Close"] < spx["BB_low"]).astype(int))
-
-spx.loc[price_series.index, "Sell_Score"] += (spx["RSI"] > 70).astype(int)
-spx.loc[price_series.index, "Sell_Score"] += (spx["Drawdown"] > -0.01).astype(int)
-spx.loc[price_series.index, "Sell_Score"] += ((spx["MACD"] < spx["MACD_signal"]).astype(int))
-spx.loc[price_series.index, "Sell_Score"] += ((spx["Stoch"] > 80).astype(int))
-spx.loc[price_series.index, "Sell_Score"] += ((spx["Close"] > spx["BB_high"]).astype(int))
-
-st.subheader("📉 SPX Price Chart")
+# Grafikonok
+st.subheader("📉 SPX Árfolyam")
 st.line_chart(spx[price_col])
 
 st.subheader("📉 Drawdown")
-st.area_chart(spx["Drawdown"])
+st.area_chart(spx['Drawdown'])
 
 st.subheader("📈 RSI")
-st.line_chart(spx["RSI"])
+st.line_chart(spx['RSI'])
 
-st.subheader("🟢 Buy & 🔴 Sell Scores (max 6)")
+st.subheader("🟢 Buy & 🔴 Sell Score (0-6)")
+import altair as alt
 
-score_df = spx.loc[price_series.index, ["Buy_Score", "Sell_Score"]].reset_index()
+df_scores = spx.reset_index()[['Date', 'Buy_Score', 'Sell_Score']]
+df_scores = df_scores.melt(id_vars='Date', value_vars=['Buy_Score', 'Sell_Score'], var_name='Signal', value_name='Score')
 
-base = alt.Chart(score_df).encode(
-    x='Date:T'
-)
+color_scale = alt.Scale(domain=['Buy_Score', 'Sell_Score'], range=['green', 'red'])
 
-buy_circles = base.mark_circle(color="green", size=60).encode(
-    y='Buy_Score:Q',
-    tooltip=['Date:T', 'Buy_Score:Q']
-).transform_filter(
-    'datum.Buy_Score > 0'
-)
+chart = alt.Chart(df_scores).mark_line().encode(
+    x='Date:T',
+    y='Score:Q',
+    color=alt.Color('Signal:N', scale=color_scale),
+    tooltip=['Date:T', 'Signal:N', 'Score:Q']
+).interactive()
 
-sell_circles = base.mark_circle(color="red", size=60).encode(
-    y='Sell_Score:Q',
-    tooltip=['Date:T', 'Sell_Score:Q']
-).transform_filter(
-    'datum.Sell_Score > 0'
-)
-
-buy_line = base.mark_line(color="green").encode(y='Buy_Score:Q')
-sell_line = base.mark_line(color="red").encode(y='Sell_Score:Q')
-
-chart = (buy_line + sell_line + buy_circles + sell_circles).properties(height=300)
 st.altair_chart(chart, use_container_width=True)
 
-st.subheader("📊 Raw Data (last 30 rows)")
+# Részletes adat táblázat
+st.subheader("📊 Részletes adatok (utolsó 30 sor)")
 st.dataframe(spx.tail(30))
+
