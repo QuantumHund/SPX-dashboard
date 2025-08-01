@@ -6,3 +6,4 @@ plotly
 matplotlib
 ta
 streamlit-autorefresh
+ta>=0.11.0
