@@ -1,119 +1,125 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import numpy as np
 import ta
 
-st.set_page_config(page_title="📊 SPX Multi-Indicator Market Score Dashboard", layout="wide")
+st.set_page_config(layout="wide")
 st.title("📊 SPX Multi-Indicator Market Score Dashboard")
 
-@st.cache_data(ttl=3600)
-def download_data(ticker, period="3mo", interval="1d"):
-    df = yf.download(ticker, period=period, interval=interval, progress=False)
-    return df
+@st.cache_data(ttl=300)
+def fetch_data(ticker, period="6mo", interval="1d"):
+    try:
+        df = yf.download(ticker, period=period, interval=interval, progress=False)
+        if df.empty:
+            st.warning(f"⚠️ Nem érkeztek adatok a {ticker} tickerhez.")
+            return pd.DataFrame()
+        # ha multiindex az oszlop
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return df
+    except Exception as e:
+        st.error(f"Adatlekérés hiba a {ticker} esetén: {e}")
+        return pd.DataFrame()
 
-# Adatok letöltése
-spx = download_data("^GSPC")
-vix = download_data("^VIX")
+spx = fetch_data("^GSPC")
 
-# Ellenőrzés, hogy letöltődtek-e az adatok és van 'Close' oszlop
-if spx.empty or 'Close' not in spx.columns:
-    st.error("❌ SPX adatok nem érhetők el vagy hiányzik az árfolyam oszlop.")
+if spx.empty:
+    st.error("❌ SPX adatok nem érhetők el.")
     st.stop()
 
-if vix.empty or 'Close' not in vix.columns:
-    st.error("❌ VIX adatok nem érhetők el vagy hiányzik az árfolyam oszlop.")
+vix = fetch_data("^VIX")
+
+# Debug print oszlopok
+st.write("SPX oszlopok:", spx.columns.tolist())
+st.write("VIX oszlopok:", vix.columns.tolist() if not vix.empty else "Nincs VIX adat")
+
+price_col = None
+for col in ['Adj Close', 'Close']:
+    if col in spx.columns:
+        price_col = col
+        break
+
+if price_col is None:
+    st.error("❌ Nem található 'Close' vagy 'Adj Close' oszlop az SPX adatok között.")
     st.stop()
 
-# Csak 1D Series az árfolyamokhoz (megakadályozzuk az ndarray (n,1) problémát)
-spx_close = spx['Close']
-vix_close = vix['Close']
+# Biztosítsuk, hogy 1D legyen az árfolyam sorozat
+spx_close = spx[price_col]
+if isinstance(spx_close, pd.DataFrame):
+    spx_close = spx_close.squeeze()
 
-# Indikátorok számítása
-spx['RSI'] = ta.momentum.RSIIndicator(spx_close, window=14).rsi()
-spx['SMA50'] = ta.trend.SMAIndicator(spx_close, window=50).sma_indicator()
-spx['SMA200'] = ta.trend.SMAIndicator(spx_close, window=200).sma_indicator()
+try:
+    spx['Drawdown'] = (spx_close / spx_close.cummax()) - 1
+    spx['RSI'] = ta.momentum.RSIIndicator(spx_close, window=14).rsi()
+    spx['SMA50'] = spx_close.rolling(window=50).mean()
+    spx['SMA200'] = spx_close.rolling(window=200).mean()
 
-macd = ta.trend.MACD(spx_close)
-spx['MACD'] = macd.macd()
-spx['MACD_signal'] = macd.macd_signal()
+    macd = ta.trend.MACD(spx_close)
+    spx['MACD'] = macd.macd()
+    spx['MACD_signal'] = macd.macd_signal()
 
-bb = ta.volatility.BollingerBands(spx_close)
-spx['BB_high'] = bb.bollinger_hband()
-spx['BB_low'] = bb.bollinger_lband()
+    bollinger = ta.volatility.BollingerBands(spx_close)
+    spx['BB_upper'] = bollinger.bollinger_hband()
+    spx['BB_lower'] = bollinger.bollinger_lband()
 
-stoch = ta.momentum.StochasticOscillator(spx['High'], spx['Low'], spx_close, window=14, smooth_window=3)
-spx['Stoch'] = stoch.stoch()
-spx['Stoch_signal'] = stoch.stoch_signal()
+    # A High és Low oszlopoknál is érdemes ellenőrizni és squeeze-elni, ha szükséges
+    spx_high = spx['High']
+    spx_low = spx['Low']
+    if isinstance(spx_high, pd.DataFrame):
+        spx_high = spx_high.squeeze()
+    if isinstance(spx_low, pd.DataFrame):
+        spx_low = spx_low.squeeze()
 
-obv = ta.volume.OnBalanceVolumeIndicator(spx_close, spx['Volume'])
-spx['OBV'] = obv.on_balance_volume()
+    stoch = ta.momentum.StochasticOscillator(spx_high, spx_low, spx_close)
+    spx['Stoch'] = stoch.stoch()
+except Exception as e:
+    st.error(f"Hiba az indikátorok számításakor: {e}")
+    st.stop()
 
-# SPX drawdown számítás (max 10%-os visszaesés jelzéshez)
-spx['Drawdown'] = (spx_close / spx_close.cummax()) - 1
+spx['Buy_Score'] = (
+    ((spx['RSI'] < 30).astype(int)) +
+    ((spx['Drawdown'] < -0.10).astype(int)) +
+    ((spx['MACD'] > spx['MACD_signal']).astype(int)) +
+    ((spx['SMA50'] > spx['SMA200']).astype(int)) +
+    ((spx_close < spx['BB_lower']).astype(int)) +
+    ((spx['Stoch'] < 20).astype(int))
+)
 
-# RSI oversold (30 alatti), VIX > 25 és csökkenő, MACD bullish crossover
-# MACD crossover megállapítása (MACD vonal keresztezi a jelzővonalat felfelé)
-macd_bullish_cross = (spx['MACD'] > spx['MACD_signal']) & (spx['MACD'].shift(1) <= spx['MACD_signal'].shift(1))
-macd_bearish_cross = (spx['MACD'] < spx['MACD_signal']) & (spx['MACD'].shift(1) >= spx['MACD_signal'].shift(1))
+spx['Sell_Score'] = (
+    ((spx['RSI'] > 70).astype(int)) +
+    ((spx['Drawdown'] > -0.01).astype(int)) +
+    ((spx['MACD'] < spx['MACD_signal']).astype(int)) +
+    ((spx['SMA50'] < spx['SMA200']).astype(int)) +
+    ((spx_close > spx['BB_upper']).astype(int)) +
+    ((spx['Stoch'] > 80).astype(int))
+)
 
-# Bearish sentiment spike - például VIX emelkedés nagyobb, mint egy küszöb
-vix['VIX_change'] = vix_close.pct_change()
-bearish_sentiment_spike = vix['VIX_change'] > 0.05  # 5% emelkedés VIX-ben napi szinten
+import altair as alt
 
-# Score összesítés
-def calc_score(row):
-    score = 0
-    # Drawdown > -10% (azaz 10%-os vagy nagyobb esés)
-    if row['Drawdown'] <= -0.10:
-        score += 1
-    # RSI < 30 oversold = jó vételi jel, tehát -1 pont (negatív)
-    if row['RSI'] < 30:
-        score -= 1
-    # VIX > 25 és csökken
-    if vix_close.loc[row.name] > 25:
-        # Nézzük, csökken-e a VIX
-        idx = vix_close.index.get_loc(row.name)
-        if idx > 0 and vix_close.iloc[idx] < vix_close.iloc[idx-1]:
-            score += 1
-    # MACD bullish crossover +1 pont
-    if macd_bullish_cross.loc[row.name]:
-        score += 1
-    # Bearish sentiment spike +1 pont
-    if row.name in bearish_sentiment_spike.index and bearish_sentiment_spike.loc[row.name]:
-        score += 1
-    return score
+st.subheader("📉 SPX Árfolyam")
+st.line_chart(spx_close)
 
-spx['Score'] = spx.apply(calc_score, axis=1)
-max_score = 5
+st.subheader("📉 Drawdown")
+st.area_chart(spx['Drawdown'])
 
-# Vizualizáció
-st.subheader("SPX és indikátorok")
+st.subheader("📈 RSI")
+st.line_chart(spx['RSI'])
 
-# Score alapján pontok színezése
-buy_points = spx[spx['Score'] >= 3]
-sell_points = spx[spx['Score'] <= 0]
+st.subheader("🟢 Buy & 🔴 Sell Score (0-6)")
 
-import matplotlib.pyplot as plt
+df_scores = spx.reset_index()[['Date', 'Buy_Score', 'Sell_Score']]
+df_scores = df_scores.melt(id_vars='Date', value_vars=['Buy_Score', 'Sell_Score'], var_name='Signal', value_name='Score')
 
-fig, ax1 = plt.subplots(figsize=(12,6))
+color_scale = alt.Scale(domain=['Buy_Score', 'Sell_Score'], range=['green', 'red'])
 
-ax1.plot(spx.index, spx_close, label="SPX Close", color="black")
-ax1.set_ylabel("SPX árfolyam", color="black")
+chart = alt.Chart(df_scores).mark_line().encode(
+    x='Date:T',
+    y='Score:Q',
+    color=alt.Color('Signal:N', scale=color_scale),
+    tooltip=['Date:T', 'Signal:N', 'Score:Q']
+).interactive()
 
-ax2 = ax1.twinx()
-ax2.plot(spx.index, spx['Score'], label="Score", color="green")
-ax2.scatter(buy_points.index, buy_points['Score'], color='green', s=50, label="Buy signal", marker='o')
-ax2.scatter(sell_points.index, sell_points['Score'], color='red', s=50, label='Sell signal', marker='o')
-ax2.set_ylabel("Market Score", color="green")
+st.altair_chart(chart, use_container_width=True)
 
-ax1.legend(loc='upper left')
-ax2.legend(loc='upper right')
-
-st.pyplot(fig)
-
-st.markdown("### SPX adatok (utolsó 5 nap)")
-st.dataframe(spx.tail())
-
-st.markdown("### VIX adatok (utolsó 5 nap)")
-st.dataframe(vix.tail())
+st.subheader("📊 Részletes adatok (utolsó 30 sor)")
+st.dataframe(spx.tail(30))
