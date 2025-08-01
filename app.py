@@ -29,10 +29,6 @@ if spx.empty:
 
 vix = fetch_data("^VIX")
 
-# Debug print oszlopok
-st.write("SPX oszlopok:", spx.columns.tolist())
-st.write("VIX oszlopok:", vix.columns.tolist() if not vix.empty else "Nincs VIX adat")
-
 price_col = None
 for col in ['Adj Close', 'Close']:
     if col in spx.columns:
@@ -43,37 +39,26 @@ if price_col is None:
     st.error("❌ Nem található 'Close' vagy 'Adj Close' oszlop az SPX adatok között.")
     st.stop()
 
-# Biztosítsuk, hogy 1D legyen az árfolyam sorozat
-spx_close = spx[price_col]
-if isinstance(spx_close, pd.DataFrame):
-    spx_close = spx_close.squeeze()
-
 try:
-    spx['Drawdown'] = (spx_close / spx_close.cummax()) - 1
-    spx['RSI'] = ta.momentum.RSIIndicator(spx_close, window=14).rsi()
-    spx['SMA50'] = spx_close.rolling(window=50).mean()
-    spx['SMA200'] = spx_close.rolling(window=200).mean()
+    spx['Drawdown'] = (spx[price_col] / spx[price_col].cummax()) - 1
+    spx['RSI'] = ta.momentum.RSIIndicator(spx[price_col], window=14).rsi()
+    spx['SMA50'] = spx[price_col].rolling(window=50).mean()
+    spx['SMA200'] = spx[price_col].rolling(window=200).mean()
 
-    macd = ta.trend.MACD(spx_close)
+    macd = ta.trend.MACD(spx[price_col])
     spx['MACD'] = macd.macd()
     spx['MACD_signal'] = macd.macd_signal()
 
-    bollinger = ta.volatility.BollingerBands(spx_close)
+    bollinger = ta.volatility.BollingerBands(spx[price_col])
     spx['BB_upper'] = bollinger.bollinger_hband()
     spx['BB_lower'] = bollinger.bollinger_lband()
 
-    # A High és Low oszlopoknál is érdemes ellenőrizni és squeeze-elni, ha szükséges
-    spx_high = spx['High']
-    spx_low = spx['Low']
-    if isinstance(spx_high, pd.DataFrame):
-        spx_high = spx_high.squeeze()
-    if isinstance(spx_low, pd.DataFrame):
-        spx_low = spx_low.squeeze()
-
-    stoch = ta.momentum.StochasticOscillator(spx_high, spx_low, spx_close)
+    stoch = ta.momentum.StochasticOscillator(spx['High'], spx['Low'], spx[price_col])
     spx['Stoch'] = stoch.stoch()
 except Exception as e:
     st.error(f"Hiba az indikátorok számításakor: {e}")
+    st.write("SPX oszlopok:", spx.columns.tolist())
+    st.write("VIX oszlopok:", vix.columns.tolist() if not vix.empty else "Nincs VIX adat")
     st.stop()
 
 spx['Buy_Score'] = (
@@ -81,7 +66,7 @@ spx['Buy_Score'] = (
     ((spx['Drawdown'] < -0.10).astype(int)) +
     ((spx['MACD'] > spx['MACD_signal']).astype(int)) +
     ((spx['SMA50'] > spx['SMA200']).astype(int)) +
-    ((spx_close < spx['BB_lower']).astype(int)) +
+    ((spx[price_col] < spx['BB_lower']).astype(int)) +
     ((spx['Stoch'] < 20).astype(int))
 )
 
@@ -90,14 +75,14 @@ spx['Sell_Score'] = (
     ((spx['Drawdown'] > -0.01).astype(int)) +
     ((spx['MACD'] < spx['MACD_signal']).astype(int)) +
     ((spx['SMA50'] < spx['SMA200']).astype(int)) +
-    ((spx_close > spx['BB_upper']).astype(int)) +
+    ((spx[price_col] > spx['BB_upper']).astype(int)) +
     ((spx['Stoch'] > 80).astype(int))
 )
 
 import altair as alt
 
 st.subheader("📉 SPX Árfolyam")
-st.line_chart(spx_close)
+st.line_chart(spx[price_col])
 
 st.subheader("📉 Drawdown")
 st.area_chart(spx['Drawdown'])
