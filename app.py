@@ -13,19 +13,18 @@ st_autorefresh(interval=300000, key="data_refresh")
 @st.cache_data(ttl=300)
 def fetch_spx_data():
     try:
-        df = yf.download("^GSPC", period="6mo", interval="1d", progress=False)
+        df = yf.download("^GSPC", period="6mo", interval="1d", group_by="ticker", progress=False)
 
         if df.empty:
             return pd.DataFrame()
 
-        # 🔧 Handle MultiIndex columns if present
+        # 🔧 Flatten MultiIndex columns if needed
         if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(1)
+            df.columns = df.columns.get_level_values(1)  # ['Open', 'High', ..., 'Adj Close']
 
-        # Drop any fully-empty columns
         df = df.dropna(how='all', axis=1)
-
         return df
+
     except Exception as e:
         st.error(f"Data fetch error: {e}")
         return pd.DataFrame()
@@ -33,7 +32,7 @@ def fetch_spx_data():
 # 📥 Get data
 spx = fetch_spx_data()
 
-# ❌ Handle failure
+# ❌ Handle fetch failure
 if spx.empty or 'Adj Close' not in spx.columns:
     st.error("❌ Failed to fetch SPX data or 'Adj Close' column is missing.")
     st.write("Debug - Columns received:", spx.columns)
