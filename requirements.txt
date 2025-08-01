@@ -6,3 +6,4 @@ plotly
 matplotlib
 ta
 streamlit-autorefresh
+altair
