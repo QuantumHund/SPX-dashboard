@@ -13,14 +13,15 @@ st_autorefresh(interval=300000, key="data_refresh")
 @st.cache_data(ttl=300)
 def fetch_spx_data():
     try:
-        df = yf.download("^GSPC", period="6mo", interval="1d", progress=False)
+        ticker = yf.Ticker("^GSPC")
+        df = ticker.history(period="6mo", interval="1d")
 
         if df.empty:
             return pd.DataFrame()
 
-        # Handle MultiIndex columns (if they appear)
+        # A history() általában nem MultiIndex, de azért ellenőrzés
         if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(1)
+            df.columns = df.columns.get_level_values(0)
 
         df = df.dropna(how='all', axis=1)
         return df
@@ -45,13 +46,13 @@ spx['RSI'] = RSIIndicator(close=spx[price_col], window=14).rsi()
 # --- Buy/Sell Scoring (0–3)
 spx['Buy_Score'] = (
     (spx['RSI'] < 30).astype(int) +
-    (spx['RSI'] < 20).astype(int) +  # stronger oversold
+    (spx['RSI'] < 20).astype(int) +
     (spx['Drawdown'] < -0.05).astype(int)
 )
 
 spx['Sell_Score'] = (
     (spx['RSI'] > 70).astype(int) +
-    (spx['RSI'] > 80).astype(int) +  # stronger overbought
+    (spx['RSI'] > 80).astype(int) +
     (spx['Drawdown'] > -0.01).astype(int)
 )
 
