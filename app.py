@@ -2,105 +2,128 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from ta.momentum import RSIIndicator, StochasticOscillator
-from ta.trend import MACD
-from ta.volatility import BollingerBands
-from ta.volume import OnBalanceVolume
+import ta
 
 st.set_page_config(layout="wide")
 st.title("📊 SPX Multi-Indicator Market Score Dashboard")
 
+# Adatok letöltése SPX és VIX
 @st.cache_data(ttl=300)
-def fetch_data(ticker):
-    df = yf.download(ticker, period="6mo", interval="1d", progress=False)
-    return df
+def fetch_data(ticker, period="6mo", interval="1d"):
+    try:
+        df = yf.download(ticker, period=period, interval=interval, progress=False)
+        if df.empty:
+            return pd.DataFrame()
+        df = df.dropna(how='all', axis=1)
+        return df
+    except Exception as e:
+        st.error(f"Data fetch error for {ticker}: {e}")
+        return pd.DataFrame()
 
 spx = fetch_data("^GSPC")
 vix = fetch_data("^VIX")
 
-# Ellenőrzés: megvannak-e az alap adatok
-if spx.empty or vix.empty:
-    st.error("❌ Nem sikerült letölteni az SPX vagy VIX adatokat.")
+price_col = 'Adj Close' if 'Adj Close' in spx.columns else 'Close'
+
+if spx.empty or price_col not in spx.columns:
+    st.error(f"❌ Failed to fetch SPX data or '{price_col}' column is missing.")
+    st.write("Debug - Columns received:", spx.columns.tolist())
     st.stop()
 
-# Válaszd ki az árfolyam oszlopot
-price_col = "Adj Close" if "Adj Close" in spx.columns else "Close"
-if price_col not in spx.columns:
-    st.error(f"Nem található '{price_col}' oszlop az SPX adatok között.")
+if vix.empty or 'Close' not in vix.columns:
+    st.error("❌ Failed to fetch VIX data or 'Close' column missing.")
     st.stop()
 
-# Alap mutatók számítása SPX-re
+# Drawdown számítása
 spx['Drawdown'] = (spx[price_col] / spx[price_col].cummax()) - 1
 
-spx['RSI'] = RSIIndicator(close=spx[price_col], window=14).rsi()
+# RSI számítása
+spx['RSI'] = ta.momentum.RSIIndicator(spx[price_col], window=14).rsi()
 
-macd = MACD(close=spx[price_col])
+# Moving Averages (50, 200)
+spx['SMA_50'] = ta.trend.SMAIndicator(spx[price_col], window=50).sma_indicator()
+spx['SMA_200'] = ta.trend.SMAIndicator(spx[price_col], window=200).sma_indicator()
+
+# Golden/Death Cross jelzés
+spx['Golden_Cross'] = ((spx['SMA_50'] > spx['SMA_200']) & (spx['SMA_50'].shift(1) <= spx['SMA_200'].shift(1))).astype(int)
+spx['Death_Cross'] = ((spx['SMA_50'] < spx['SMA_200']) & (spx['SMA_50'].shift(1) >= spx['SMA_200'].shift(1))).astype(int)
+
+# MACD számítása
+macd = ta.trend.MACD(spx[price_col])
 spx['MACD'] = macd.macd()
 spx['MACD_Signal'] = macd.macd_signal()
+spx['MACD_Bullish_Crossover'] = ((spx['MACD'] > spx['MACD_Signal']) & (spx['MACD'].shift(1) <= spx['MACD_Signal'].shift(1))).astype(int)
 
-bb = BollingerBands(close=spx[price_col])
+# Bollinger Bands
+bb = ta.volatility.BollingerBands(spx[price_col])
 spx['BB_High'] = bb.bollinger_hband()
 spx['BB_Low'] = bb.bollinger_lband()
 
-stoch = StochasticOscillator(high=spx['High'], low=spx['Low'], close=spx[price_col])
+# Stochastic Oscillator
+stoch = ta.momentum.StochasticOscillator(spx['High'], spx['Low'], spx[price_col], window=14, smooth_window=3)
 spx['Stoch'] = stoch.stoch()
+spx['Stoch_Signal'] = stoch.stoch_signal()
 
-spx['OBV'] = OnBalanceVolume(close=spx[price_col], volume=spx['Volume']).on_balance_volume()
+# Manuális OBV számítás
+def calculate_obv(df):
+    obv = [0]
+    for i in range(1, len(df)):
+        if df[price_col].iloc[i] > df[price_col].iloc[i-1]:
+            obv.append(obv[-1] + df['Volume'].iloc[i])
+        elif df[price_col].iloc[i] < df[price_col].iloc[i-1]:
+            obv.append(obv[-1] - df['Volume'].iloc[i])
+        else:
+            obv.append(obv[-1])
+    return pd.Series(obv, index=df.index)
 
-# VIX indikátor (egyszerű jelzés: VIX > 25 és csökkenő)
-vix['VIX_Falling'] = vix['Close'].diff() < 0
+spx['OBV'] = calculate_obv(spx)
 
-# Score számítása (max 6 pont)
-spx['Score'] = 0
+# VIX 25 felett és csökkenő?
+vix['VIX_Falling'] = (vix['Close'] < vix['Close'].shift(1)).astype(int)
+vix_condition = (vix['Close'] > 25) & (vix['VIX_Falling'] == 1)
 
-# 1 pont: Drawdown nagyobb mint -10%
-spx.loc[spx['Drawdown'] < -0.10, 'Score'] += 1
+# Score kalkuláció (max 6 pont)
+spx['Score'] = (
+    (spx['Drawdown'] < -0.10).astype(int) +         # nagyobb mint 10% drawdown -> 1 pont
+    (spx['RSI'] < 30).astype(int) +                 # RSI oversold -> 1 pont
+    spx['MACD_Bullish_Crossover'] +                  # MACD bullish crossover -> 1 pont
+    spx['Golden_Cross'] +                             # Golden cross -> 1 pont
+    (spx['Stoch'] < 20).astype(int) +                # Stoch oversold -> 1 pont
+    # OBV növekedés (aktuális vs 5 nappal korábbi) - ha OBV nőtt, akkor +1 pont
+    ((spx['OBV'] > spx['OBV'].shift(5)).astype(int))
+)
 
-# 1 pont: RSI oversold (RSI < 30)
-spx.loc[spx['RSI'] < 30, 'Score'] += 1
+# Ha VIX adat elérhető, a score-hoz hozzáadhatjuk a VIX jelet
+# De mivel külön adat, nem teljesen egy sorban, így ezt jelezzük külön
+latest_vix = vix.iloc[-1] if not vix.empty else None
+vix_signal = "✅ VIX > 25 és csökkenő" if latest_vix is not None and latest_vix['Close'] > 25 and latest_vix['VIX_Falling'] == 1 else "❌ VIX jelzés nem teljesül"
 
-# 1 pont: VIX > 25 és csökkenő
-if not vix.empty:
-    vix_latest = vix.iloc[-1]
-    if vix_latest['Close'] > 25 and vix_latest['VIX_Falling']:
-        spx['Score'] += 1  # VIX indikátor pontot az egész időszakra adom, lehet finomítani
-
-# 1 pont: MACD bullish crossover (MACD vonal a jelzővonal felett)
-spx.loc[spx['MACD'] > spx['MACD_Signal'], 'Score'] += 1
-
-# 1 pont: Stochastic oversold jelzés (Stoch < 20)
-spx.loc[spx['Stoch'] < 20, 'Score'] += 1
-
-# 1 pont: Árfolyam a Bollinger alsó szalag közelében
-spx.loc[spx[price_col] < spx['BB_Low'], 'Score'] += 1
-
-# Végső értékelés max 6 pont
-
-# Grafikonok megjelenítése
-st.subheader("📉 SPX Price Chart")
+# Megjelenítés
+st.subheader("📉 SPX Close Price")
 st.line_chart(spx[price_col])
-
-st.subheader("📈 RSI")
-st.line_chart(spx['RSI'])
-
-st.subheader("📈 MACD és Signal Line")
-st.line_chart(spx[['MACD', 'MACD_Signal']])
-
-st.subheader("📈 Stochastic Oscillator")
-st.line_chart(spx['Stoch'])
 
 st.subheader("📉 Drawdown")
 st.area_chart(spx['Drawdown'])
 
-st.subheader("📈 Bollinger Bands")
-st.line_chart(pd.DataFrame({
-    'Price': spx[price_col],
-    'BB High': spx['BB_High'],
-    'BB Low': spx['BB_Low']
-}))
+st.subheader("📈 RSI")
+st.line_chart(spx['RSI'])
 
-st.subheader("📊 Market Score (0-6)")
+st.subheader("⚡ MACD Bullish Crossover")
+st.line_chart(spx['MACD_Bullish_Crossover'])
+
+st.subheader("🟢 Golden / 🔴 Death Cross")
+st.line_chart(spx[['Golden_Cross', 'Death_Cross']])
+
+st.subheader("📊 Stochastic Oscillator")
+st.line_chart(spx[['Stoch', 'Stoch_Signal']])
+
+st.subheader("📈 OBV (On-Balance Volume)")
+st.line_chart(spx['OBV'])
+
+st.subheader("📊 Market Score (max 6)")
 st.line_chart(spx['Score'])
 
-st.subheader("📊 Raw Data Table (last 30 rows)")
+st.markdown(f"### VIX Jelzés: {vix_signal}")
+
+st.subheader("📊 Raw Data (last 30 rows)")
 st.dataframe(spx.tail(30))
