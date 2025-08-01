@@ -5,7 +5,7 @@ from ta.momentum import RSIIndicator
 from streamlit_autorefresh import st_autorefresh
 
 st.set_page_config(layout="wide")
-st.title("📊 SPX Live Dashboard with RSI (ta)")
+st.title("📊 SPX Live Dashboard (RSI + Drawdown)")
 
 # Auto-refresh every 5 minutes
 st_autorefresh(interval=300000, key="data_refresh")
@@ -18,6 +18,7 @@ def fetch_spx_data():
         if df.empty:
             return pd.DataFrame()
 
+        # Handle MultiIndex columns (if they appear)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(1)
 
@@ -28,44 +29,33 @@ def fetch_spx_data():
         st.error(f"Data fetch error: {e}")
         return pd.DataFrame()
 
+# --- Load and prepare data
 spx = fetch_spx_data()
-
-# Determine price column
 price_col = 'Adj Close' if 'Adj Close' in spx.columns else 'Close'
 
 if spx.empty or price_col not in spx.columns:
     st.error(f"❌ Failed to fetch SPX data or '{price_col}' column is missing.")
-    st.write("Debug - Columns received:", spx.columns)
+    st.write("Debug - Columns received:", list(spx.columns))
     st.stop()
 
-# --- Indicators ---
+# --- Indicators
+spx['Drawdown'] = (spx[price_col] / spx[price_col].cummax()) - 1
+spx['RSI'] = RSIIndicator(close=spx[price_col], window=14).rsi()
 
-# Ensure 1D Series
-close_series = spx[price_col]
-if isinstance(close_series, pd.DataFrame):
-    close_series = close_series.iloc[:, 0]
-
-# RSI (ta)
-spx['RSI'] = RSIIndicator(close=close_series, window=14).rsi()
-
-# Drawdown
-spx['Drawdown'] = (close_series / close_series.cummax()) - 1
-
-# Scoring: Buy and Sell scores from 0–3
+# --- Buy/Sell Scoring (0–3)
 spx['Buy_Score'] = (
     (spx['RSI'] < 30).astype(int) +
-    (spx['Drawdown'] < -0.05).astype(int) +
-    (spx['RSI'] < 20).astype(int)
+    (spx['RSI'] < 20).astype(int) +  # stronger oversold
+    (spx['Drawdown'] < -0.05).astype(int)
 )
 
 spx['Sell_Score'] = (
     (spx['RSI'] > 70).astype(int) +
-    (spx['Drawdown'] > -0.01).astype(int) +
-    (spx['RSI'] > 80).astype(int)
+    (spx['RSI'] > 80).astype(int) +  # stronger overbought
+    (spx['Drawdown'] > -0.01).astype(int)
 )
 
-# --- Visuals ---
-
+# --- Charts
 st.subheader("📉 SPX Price Chart")
 st.line_chart(spx[[price_col]])
 
