@@ -8,9 +8,12 @@ st.title("📊 SPX Multi-Indicator Market Score Dashboard")
 
 @st.cache_data(ttl=300)
 def fetch_data(ticker, period="6mo", interval="1d"):
-    return yf.download(ticker, period=period, interval=interval, progress=False)
+    df = yf.download(ticker, period=period, interval=interval, progress=False)
+    # Ha multiindex az oszlop, akkor level-eljük
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(-1)
+    return df
 
-# Adatok lekérése
 spx = fetch_data("^GSPC")
 vix = fetch_data("^VIX")
 
@@ -20,93 +23,95 @@ if spx.empty or vix.empty:
 
 price_col = "Adj Close" if "Adj Close" in spx.columns else "Close"
 
-# 1) Drawdown számítása
+# Drawdown számítás
 spx['Drawdown'] = (spx[price_col] / spx[price_col].cummax()) - 1
 
-# 2) RSI
+# RSI
 spx['RSI'] = ta.momentum.RSIIndicator(spx[price_col], window=14).rsi()
 
-# 3) MACD
+# Moving Averages
+spx['SMA50'] = spx[price_col].rolling(window=50).mean()
+spx['SMA200'] = spx[price_col].rolling(window=200).mean()
+spx['EMA50'] = spx[price_col].ewm(span=50, adjust=False).mean()
+
+# MACD
 macd = ta.trend.MACD(spx[price_col])
 spx['MACD'] = macd.macd()
-spx['MACD_Signal'] = macd.macd_signal()
-spx['MACD_Bullish_Crossover'] = (spx['MACD'] > spx['MACD_Signal']) & (spx['MACD'].shift(1) <= spx['MACD_Signal'].shift(1))
+spx['MACD_signal'] = macd.macd_signal()
+spx['MACD_diff'] = macd.macd_diff()
 
-# 4) SMA 50 és 200, Golden Cross
-spx['SMA_50'] = spx[price_col].rolling(window=50).mean()
-spx['SMA_200'] = spx[price_col].rolling(window=200).mean()
-golden_cross = (spx['SMA_50'].iloc[-1] > spx['SMA_200'].iloc[-1])
+# Bollinger Bands
+bollinger = ta.volatility.BollingerBands(spx[price_col])
+spx['BB_high'] = bollinger.bollinger_hband()
+spx['BB_low'] = bollinger.bollinger_lband()
 
-# 5) Stochastic Oscillator
-stoch = ta.momentum.StochasticOscillator(high=spx['High'], low=spx['Low'], close=spx[price_col], window=14, smooth_window=3)
-spx['Stoch_K'] = stoch.stoch()
-spx['Stoch_D'] = stoch.stoch_signal()
-stoch_oversold = spx['Stoch_K'].iloc[-1] < 20
+# Stochastic Oscillator
+stoch = ta.momentum.StochasticOscillator(spx['High'], spx['Low'], spx[price_col])
+spx['Stoch'] = stoch.stoch()
 
-# 6) Bollinger Bands
-bb = ta.volatility.BollingerBands(spx[price_col], window=20, window_dev=2)
-spx['BB_High'] = bb.bollinger_hband()
-spx['BB_Low'] = bb.bollinger_lband()
-# Bollinger squeeze - ha a sávok szűkülnek, jelezhet egy mozgást
-bb_width = spx['BB_High'] - spx['BB_Low']
-bb_squeeze = bb_width.iloc[-1] < bb_width.rolling(window=20).mean().iloc[-1] * 0.7
-
-# 7) OBV (On-Balance Volume)
+# On-Balance Volume (OBV)
 spx['OBV'] = ta.volume.OnBalanceVolumeIndicator(spx[price_col], spx['Volume']).on_balance_volume()
 
-# 8) VIX elemzés (árfolyam + csökkenő volatilitás)
+# VIX záróár és mozgása
 vix_close = vix['Close']
-vix_latest = vix_close.iloc[-1]
-vix_prev = vix_close.iloc[-2]
-vix_alert = (vix_latest > 25) and (vix_latest < vix_prev)
+vix_diff = vix_close.diff()
 
-# Score számítása (max 8 pont)
-score = 0
-score += 1 if spx['RSI'].iloc[-1] < 30 else 0
-score += 1 if spx['Drawdown'].iloc[-1] < -0.10 else 0
-score += 1 if vix_alert else 0
-score += 1 if spx['MACD_Bullish_Crossover'].iloc[-1] else 0
-score += 1 if golden_cross else 0
-score += 1 if stoch_oversold else 0
-score += 1 if bb_squeeze else 0
-# OBV trend vizsgálat: OBV növekszik az elmúlt 5 napban?
-obv_trend = spx['OBV'].iloc[-5:].is_monotonic_increasing
-score += 1 if obv_trend else 0
+# Score alapjai (0-6 pont max)
+score = pd.Series(0, index=spx.index)
 
-def score_color(sc):
-    if sc >= 6:
-        return "🟢 Erős vételi jel"
-    elif sc >= 3:
-        return "🟡 Figyelmeztetés"
-    else:
-        return "🔴 Gyenge jel vagy eladási hangulat"
+# 1. Drawdown >10% figyelmeztetés
+score += (spx['Drawdown'] < -0.10).astype(int)  # +1
 
-st.header(f"📊 Összesített Market Score: {score}/8")
-st.markdown(f"**Állapot:** {score_color(score)}")
+# 2. RSI oversold (RSI < 30)
+score += (spx['RSI'] < 30).astype(int)  # +1
 
-# Grafikonok
+# 3. VIX > 25 és csökken (volatilitás enyhül)
+vix_flag = ((vix_close > 25) & (vix_diff < 0)).reindex(spx.index, method='ffill').fillna(False)
+score += vix_flag.astype(int)  # +1
 
-st.subheader("SPX Close és Drawdown")
-st.line_chart(spx[[price_col, 'Drawdown']])
+# 4. MACD bullish crossover
+macd_bull_cross = (spx['MACD'] > spx['MACD_signal']) & (spx['MACD'].shift(1) <= spx['MACD_signal'].shift(1))
+score += macd_bull_cross.astype(int)  # +1
 
-st.subheader("RSI")
+# 5. Bollinger Bands squeeze (szűkülés) - alacsony volatilitás -> potenciális mozgás
+bb_width = spx['BB_high'] - spx['BB_low']
+bb_squeeze = bb_width < bb_width.rolling(window=20).mean()
+score += bb_squeeze.astype(int)  # +1
+
+# 6. SMA50 / SMA200 Golden Cross (bullish trend)
+golden_cross = (spx['SMA50'] > spx['SMA200']) & (spx['SMA50'].shift(1) <= spx['SMA200'].shift(1))
+score += golden_cross.astype(int)  # +1
+
+spx['Market_Score'] = score
+
+# --- Vizualizációk ---
+
+import matplotlib.pyplot as plt
+
+st.subheader("📉 SPX Price Chart")
+st.line_chart(spx[price_col])
+
+st.subheader("📉 Drawdown")
+st.area_chart(spx['Drawdown'])
+
+st.subheader("📈 RSI")
 st.line_chart(spx['RSI'])
 
-st.subheader("MACD és jelvonal")
-st.line_chart(spx[['MACD', 'MACD_Signal']])
+st.subheader("🟢 Market Score (0-6)")
+fig, ax = plt.subplots(figsize=(10, 4))
+ax.plot(spx.index, spx['Market_Score'], label='Market Score', color='blue')
 
-st.subheader("SMA 50 és SMA 200")
-st.line_chart(spx[['SMA_50', 'SMA_200']])
+# Jelölések a magas pontszámokra (>=4)
+high_score = spx['Market_Score'] >= 4
+ax.scatter(spx.index[high_score], spx['Market_Score'][high_score], color='green', s=50, label='High Score (≥4)')
 
-st.subheader("Stochastic Oscillator K és D")
-st.line_chart(spx[['Stoch_K', 'Stoch_D']])
+ax.set_ylim(0, 6.5)
+ax.set_ylabel('Score')
+ax.legend()
+st.pyplot(fig)
 
-st.subheader("Bollinger Bands és BB Width")
-st.line_chart(spx[[price_col, 'BB_High', 'BB_Low']])
-st.line_chart(bb_width)
+st.subheader("📈 MACD and Signal")
+st.line_chart(spx[['MACD', 'MACD_signal']])
 
-st.subheader("On-Balance Volume (OBV)")
-st.line_chart(spx['OBV'])
-
-st.subheader("VIX Close")
-st.line_chart(vix_close)
+st.subheader("📊 Raw Data (last 30 rows)")
+st.dataframe(spx.tail(30))
