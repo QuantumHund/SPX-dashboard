@@ -14,7 +14,6 @@ def fetch_data(ticker, period="6mo", interval="1d"):
         if df.empty:
             st.warning(f"⚠️ Nem érkeztek adatok a {ticker} tickerhez.")
             return pd.DataFrame()
-        # ha multiindex az oszlop
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         return df
@@ -23,12 +22,11 @@ def fetch_data(ticker, period="6mo", interval="1d"):
         return pd.DataFrame()
 
 spx = fetch_data("^GSPC")
+vix = fetch_data("^VIX")
 
 if spx.empty:
     st.error("❌ SPX adatok nem érhetők el.")
     st.stop()
-
-vix = fetch_data("^VIX")
 
 price_col = None
 for col in ['Adj Close', 'Close']:
@@ -81,39 +79,46 @@ spx['Sell_Score'] = (
 st.subheader("📉 SPX Árfolyam")
 st.line_chart(spx[price_col])
 
+if not vix.empty:
+    vix_chart = alt.Chart(vix.reset_index()).mark_line(color='orange').encode(
+        x='Date:T',
+        y=alt.Y('Close:Q', title='VIX')
+    ).properties(title="📈 VIX Index")
+    st.altair_chart(vix_chart, use_container_width=True)
+
 st.subheader("📉 Drawdown")
 st.area_chart(spx['Drawdown'])
 
 st.subheader("📈 RSI")
-st.line_chart(spx['RSI'])
+rsi_df = spx.reset_index()[['Date', 'RSI']].dropna()
+rsi_chart = alt.Chart(rsi_df).mark_line(color='blue').encode(
+    x='Date:T',
+    y=alt.Y('RSI:Q', scale=alt.Scale(domain=[0, 100]))
+)
+
+rsi_background = alt.Chart(rsi_df).mark_rect(opacity=0.1, color='green').encode(
+    x='Date:T',
+    y=alt.Y('RSI:Q', bin=alt.Bin(step=1))
+).transform_filter('datum.RSI < 30')
+
+rsi_background_red = alt.Chart(rsi_df).mark_rect(opacity=0.1, color='red').encode(
+    x='Date:T',
+    y=alt.Y('RSI:Q', bin=alt.Bin(step=1))
+).transform_filter('datum.RSI > 70')
+
+st.altair_chart(rsi_chart + rsi_background + rsi_background_red, use_container_width=True)
 
 st.subheader("🟢 Buy & 🔴 Sell Score (0-6)")
-
 df_scores = spx.reset_index()[['Date', 'Buy_Score', 'Sell_Score']]
 df_scores = df_scores.melt(id_vars='Date', value_vars=['Buy_Score', 'Sell_Score'], var_name='Signal', value_name='Score')
 
 color_scale = alt.Scale(domain=['Buy_Score', 'Sell_Score'], range=['green', 'red'])
-
-chart = (
-    alt.Chart(df_scores)
-    .mark_line()
-    .encode(
-        x='Date:T',
-        y='Score:Q',
-        color=alt.Color('Signal:N', scale=color_scale),
-        tooltip=['Date:T', 'Signal:N', 'Score:Q']
-    )
-    .interactive()
-) + (
-    alt.Chart(df_scores)
-    .mark_circle(size=80)
-    .encode(
-        x='Date:T',
-        y='Score:Q',
-        color=alt.Color('Signal:N', scale=color_scale),
-        tooltip=['Date:T', 'Signal:N', 'Score:Q']
-    )
-)
+chart = alt.Chart(df_scores).mark_line().encode(
+    x='Date:T',
+    y='Score:Q',
+    color=alt.Color('Signal:N', scale=color_scale),
+    tooltip=['Date:T', 'Signal:N', 'Score:Q']
+).interactive()
 
 st.altair_chart(chart, use_container_width=True)
 
