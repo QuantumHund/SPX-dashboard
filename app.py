@@ -2,6 +2,7 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import ta
+import altair as alt
 
 st.set_page_config(layout="wide")
 st.title("📊 SPX Multi-Indicator Market Score Dashboard")
@@ -57,8 +58,6 @@ try:
     spx['Stoch'] = stoch.stoch()
 except Exception as e:
     st.error(f"Hiba az indikátorok számításakor: {e}")
-    st.write("SPX oszlopok:", spx.columns.tolist())
-    st.write("VIX oszlopok:", vix.columns.tolist() if not vix.empty else "Nincs VIX adat")
     st.stop()
 
 spx['Buy_Score'] = (
@@ -79,8 +78,6 @@ spx['Sell_Score'] = (
     ((spx['Stoch'] > 80).astype(int))
 )
 
-import altair as alt
-
 st.subheader("📉 SPX Árfolyam")
 st.line_chart(spx[price_col])
 
@@ -97,12 +94,26 @@ df_scores = df_scores.melt(id_vars='Date', value_vars=['Buy_Score', 'Sell_Score'
 
 color_scale = alt.Scale(domain=['Buy_Score', 'Sell_Score'], range=['green', 'red'])
 
-chart = alt.Chart(df_scores).mark_line().encode(
-    x='Date:T',
-    y='Score:Q',
-    color=alt.Color('Signal:N', scale=color_scale),
-    tooltip=['Date:T', 'Signal:N', 'Score:Q']
-).interactive()
+chart = (
+    alt.Chart(df_scores)
+    .mark_line()
+    .encode(
+        x='Date:T',
+        y='Score:Q',
+        color=alt.Color('Signal:N', scale=color_scale),
+        tooltip=['Date:T', 'Signal:N', 'Score:Q']
+    )
+    .interactive()
+) + (
+    alt.Chart(df_scores)
+    .mark_circle(size=80)
+    .encode(
+        x='Date:T',
+        y='Score:Q',
+        color=alt.Color('Signal:N', scale=color_scale),
+        tooltip=['Date:T', 'Signal:N', 'Score:Q']
+    )
+)
 
 st.altair_chart(chart, use_container_width=True)
 
