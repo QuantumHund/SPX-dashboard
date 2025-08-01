@@ -1,109 +1,112 @@
 import streamlit as st
-import pandas as pd
 import yfinance as yf
-from ta.momentum import RSIIndicator
-from streamlit_autorefresh import st_autorefresh
-import altair as alt
+import pandas as pd
+import ta
 
 st.set_page_config(layout="wide")
-st.title("📊 SPX Live Dashboard (RSI + Drawdown)")
-
-# Auto-refresh every 5 minutes (300000 ms)
-st_autorefresh(interval=300000, key="data_refresh")
+st.title("📊 SPX Multi-Indicator Market Score Dashboard")
 
 @st.cache_data(ttl=300)
-def fetch_spx_data():
-    try:
-        ticker = yf.Ticker("^GSPC")
-        df = ticker.history(period="6mo", interval="1d")
+def fetch_data(ticker, period="6mo", interval="1d"):
+    return yf.download(ticker, period=period, interval=interval, progress=False)
 
-        if df.empty:
-            return pd.DataFrame()
+# Adatok lekérése
+spx = fetch_data("^GSPC")
+vix = fetch_data("^VIX")
 
-        # Ha multiindex az oszlop, pl. Adj Close, levesszük a szinteket
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        df = df.dropna(how='all', axis=1)
-        return df
-
-    except Exception as e:
-        st.error(f"Data fetch error: {e}")
-        return pd.DataFrame()
-
-spx = fetch_spx_data()
-price_col = 'Adj Close' if 'Adj Close' in spx.columns else 'Close'
-
-if spx.empty or price_col not in spx.columns:
-    st.error(f"❌ Failed to fetch SPX data or '{price_col}' column is missing.")
-    st.write("Debug - Columns received:", list(spx.columns))
+if spx.empty or vix.empty:
+    st.error("Nem sikerült letölteni az adatokat.")
     st.stop()
 
-# Drawdown = jelenlegi ár / eddigi legmagasabb ár - 1
+price_col = "Adj Close" if "Adj Close" in spx.columns else "Close"
+
+# 1) Drawdown számítása
 spx['Drawdown'] = (spx[price_col] / spx[price_col].cummax()) - 1
 
-# RSI számítás
-spx['RSI'] = RSIIndicator(close=spx[price_col], window=14).rsi()
+# 2) RSI
+spx['RSI'] = ta.momentum.RSIIndicator(spx[price_col], window=14).rsi()
 
-# Buy Score (0-3 pont)
-spx['Buy_Score'] = (
-    (spx['RSI'] < 30).astype(int) +
-    (spx['RSI'] < 20).astype(int) +
-    (spx['Drawdown'] < -0.05).astype(int)
-)
+# 3) MACD
+macd = ta.trend.MACD(spx[price_col])
+spx['MACD'] = macd.macd()
+spx['MACD_Signal'] = macd.macd_signal()
+spx['MACD_Bullish_Crossover'] = (spx['MACD'] > spx['MACD_Signal']) & (spx['MACD'].shift(1) <= spx['MACD_Signal'].shift(1))
 
-# Sell Score (0-3 pont)
-spx['Sell_Score'] = (
-    (spx['RSI'] > 70).astype(int) +
-    (spx['RSI'] > 80).astype(int) +
-    (spx['Drawdown'] > -0.01).astype(int)
-)
+# 4) SMA 50 és 200, Golden Cross
+spx['SMA_50'] = spx[price_col].rolling(window=50).mean()
+spx['SMA_200'] = spx[price_col].rolling(window=200).mean()
+golden_cross = (spx['SMA_50'].iloc[-1] > spx['SMA_200'].iloc[-1])
 
-# Altair chart készítése
-chart_data = spx.reset_index()[['Date', 'Buy_Score', 'Sell_Score']]
+# 5) Stochastic Oscillator
+stoch = ta.momentum.StochasticOscillator(high=spx['High'], low=spx['Low'], close=spx[price_col], window=14, smooth_window=3)
+spx['Stoch_K'] = stoch.stoch()
+spx['Stoch_D'] = stoch.stoch_signal()
+stoch_oversold = spx['Stoch_K'].iloc[-1] < 20
 
-buy_line = alt.Chart(chart_data).mark_line(color='green').encode(
-    x='Date:T',
-    y='Buy_Score:Q',
-    tooltip=['Date:T', 'Buy_Score']
-)
+# 6) Bollinger Bands
+bb = ta.volatility.BollingerBands(spx[price_col], window=20, window_dev=2)
+spx['BB_High'] = bb.bollinger_hband()
+spx['BB_Low'] = bb.bollinger_lband()
+# Bollinger squeeze - ha a sávok szűkülnek, jelezhet egy mozgást
+bb_width = spx['BB_High'] - spx['BB_Low']
+bb_squeeze = bb_width.iloc[-1] < bb_width.rolling(window=20).mean().iloc[-1] * 0.7
 
-sell_line = alt.Chart(chart_data).mark_line(color='red').encode(
-    x='Date:T',
-    y='Sell_Score:Q',
-    tooltip=['Date:T', 'Sell_Score']
-)
+# 7) OBV (On-Balance Volume)
+spx['OBV'] = ta.volume.OnBalanceVolumeIndicator(spx[price_col], spx['Volume']).on_balance_volume()
 
-buy_points = alt.Chart(chart_data[chart_data['Buy_Score'] >= 2]).mark_circle(color='green', size=100).encode(
-    x='Date:T',
-    y='Buy_Score:Q',
-    tooltip=['Date:T', 'Buy_Score']
-)
+# 8) VIX elemzés (árfolyam + csökkenő volatilitás)
+vix_close = vix['Close']
+vix_latest = vix_close.iloc[-1]
+vix_prev = vix_close.iloc[-2]
+vix_alert = (vix_latest > 25) and (vix_latest < vix_prev)
 
-sell_points = alt.Chart(chart_data[chart_data['Sell_Score'] >= 2]).mark_circle(color='red', size=100).encode(
-    x='Date:T',
-    y='Sell_Score:Q',
-    tooltip=['Date:T', 'Sell_Score']
-)
+# Score számítása (max 8 pont)
+score = 0
+score += 1 if spx['RSI'].iloc[-1] < 30 else 0
+score += 1 if spx['Drawdown'].iloc[-1] < -0.10 else 0
+score += 1 if vix_alert else 0
+score += 1 if spx['MACD_Bullish_Crossover'].iloc[-1] else 0
+score += 1 if golden_cross else 0
+score += 1 if stoch_oversold else 0
+score += 1 if bb_squeeze else 0
+# OBV trend vizsgálat: OBV növekszik az elmúlt 5 napban?
+obv_trend = spx['OBV'].iloc[-5:].is_monotonic_increasing
+score += 1 if obv_trend else 0
 
-final_chart = (buy_line + sell_line + buy_points + sell_points).properties(
-    width=900,
-    height=400,
-    title="🟢 Buy Score és 🔴 Sell Score (kiemelt pontok)"
-).interactive()
+def score_color(sc):
+    if sc >= 6:
+        return "🟢 Erős vételi jel"
+    elif sc >= 3:
+        return "🟡 Figyelmeztetés"
+    else:
+        return "🔴 Gyenge jel vagy eladási hangulat"
 
-# Megjelenítés
-st.subheader("📉 SPX Price Chart")
-st.line_chart(spx[[price_col]])
+st.header(f"📊 Összesített Market Score: {score}/8")
+st.markdown(f"**Állapot:** {score_color(score)}")
 
-st.subheader("📉 Drawdown")
-st.area_chart(spx['Drawdown'])
+# Grafikonok
 
-st.subheader("📈 RSI")
+st.subheader("SPX Close és Drawdown")
+st.line_chart(spx[[price_col, 'Drawdown']])
+
+st.subheader("RSI")
 st.line_chart(spx['RSI'])
 
-st.subheader("🟢 Buy & 🔴 Sell Scores (0-3) kiemelt pontokkal")
-st.altair_chart(final_chart, use_container_width=True)
+st.subheader("MACD és jelvonal")
+st.line_chart(spx[['MACD', 'MACD_Signal']])
 
-st.subheader("📊 Raw Data Table (last 30 rows)")
-st.dataframe(spx.tail(30))
+st.subheader("SMA 50 és SMA 200")
+st.line_chart(spx[['SMA_50', 'SMA_200']])
+
+st.subheader("Stochastic Oscillator K és D")
+st.line_chart(spx[['Stoch_K', 'Stoch_D']])
+
+st.subheader("Bollinger Bands és BB Width")
+st.line_chart(spx[[price_col, 'BB_High', 'BB_Low']])
+st.line_chart(bb_width)
+
+st.subheader("On-Balance Volume (OBV)")
+st.line_chart(spx['OBV'])
+
+st.subheader("VIX Close")
+st.line_chart(vix_close)
