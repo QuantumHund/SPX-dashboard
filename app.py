@@ -3,6 +3,7 @@ import pandas as pd
 import yfinance as yf
 from ta.momentum import RSIIndicator
 from streamlit_autorefresh import st_autorefresh
+import altair as alt
 
 st.set_page_config(layout="wide")
 st.title("📊 SPX Live Dashboard (RSI + Drawdown)")
@@ -19,7 +20,6 @@ def fetch_spx_data():
         if df.empty:
             return pd.DataFrame()
 
-        # A history() általában nem MultiIndex, de azért ellenőrzés
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
@@ -30,7 +30,6 @@ def fetch_spx_data():
         st.error(f"Data fetch error: {e}")
         return pd.DataFrame()
 
-# --- Load and prepare data
 spx = fetch_spx_data()
 price_col = 'Adj Close' if 'Adj Close' in spx.columns else 'Close'
 
@@ -39,11 +38,9 @@ if spx.empty or price_col not in spx.columns:
     st.write("Debug - Columns received:", list(spx.columns))
     st.stop()
 
-# --- Indicators
 spx['Drawdown'] = (spx[price_col] / spx[price_col].cummax()) - 1
 spx['RSI'] = RSIIndicator(close=spx[price_col], window=14).rsi()
 
-# --- Buy/Sell Scoring (0–3)
 spx['Buy_Score'] = (
     (spx['RSI'] < 30).astype(int) +
     (spx['RSI'] < 20).astype(int) +
@@ -56,18 +53,40 @@ spx['Sell_Score'] = (
     (spx['Drawdown'] > -0.01).astype(int)
 )
 
-# --- Charts
-st.subheader("📉 SPX Price Chart")
-st.line_chart(spx[[price_col]])
+# Készítsünk DataFrame-et Altair-nek dátummal
+chart_data = spx.reset_index()[['Date', 'Buy_Score', 'Sell_Score']]
 
-st.subheader("📉 Drawdown")
-st.area_chart(spx['Drawdown'])
+# Alap vonalak
+buy_line = alt.Chart(chart_data).mark_line(color='green').encode(
+    x='Date:T',
+    y='Buy_Score:Q',
+    tooltip=['Date:T', 'Buy_Score']
+)
 
-st.subheader("📈 RSI")
-st.line_chart(spx['RSI'])
+sell_line = alt.Chart(chart_data).mark_line(color='red').encode(
+    x='Date:T',
+    y='Sell_Score:Q',
+    tooltip=['Date:T', 'Sell_Score']
+)
 
-st.subheader("🟢 Buy & 🔴 Sell Scores (0–3)")
-st.line_chart(spx[['Buy_Score', 'Sell_Score']])
+# Kiemelt pontok Buy (score >= 2)
+buy_points = alt.Chart(chart_data[chart_data['Buy_Score'] >= 2]).mark_circle(color='green', size=100).encode(
+    x='Date:T',
+    y='Buy_Score:Q',
+    tooltip=['Date:T', 'Buy_Score']
+)
 
-st.subheader("📊 Raw Data Table (last 30 rows)")
-st.dataframe(spx.tail(30))
+# Kiemelt pontok Sell (score >= 2)
+sell_points = alt.Chart(chart_data[chart_data['Sell_Score'] >= 2]).mark_circle(color='red', size=100).encode(
+    x='Date:T',
+    y='Sell_Score:Q',
+    tooltip=['Date:T', 'Sell_Score']
+)
+
+final_chart = (buy_line + sell_line + buy_points + sell_points).properties(
+    width=900,
+    height=400,
+    title="🟢 Buy Score és 🔴 Sell Score (kiemelt pontok)"
+).interactive()
+
+st.altair_chart(final_chart, use_container_width=True)
