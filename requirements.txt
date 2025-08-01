@@ -4,5 +4,5 @@ pandas
 numpy
 plotly
 matplotlib
+ta
 streamlit-autorefresh
-TA-Lib
