@@ -3,9 +3,10 @@ import yfinance as yf
 import pandas as pd
 import ta
 import altair as alt
+import numpy as np
 
 st.set_page_config(layout="wide")
-st.title("📊 SPX Multi-Indicator Market Score Dashboard")
+st.title("📊 SPX Multi-Indicator Market Score Dashboard - 8 Faktoros Verzió")
 
 @st.cache_data(ttl=300)
 def fetch_data(ticker, period="6mo", interval="1d"):
@@ -21,26 +22,29 @@ def fetch_data(ticker, period="6mo", interval="1d"):
         st.error(f"Adatlekérés hiba a {ticker} esetén: {e}")
         return pd.DataFrame()
 
+# Adatok letöltése
 spx = fetch_data("^GSPC")
+vix = fetch_data("^VIX")
 
 if spx.empty:
     st.error("❌ SPX adatok nem érhetők el.")
     st.stop()
 
-vix = fetch_data("^VIX")
+if vix.empty:
+    st.warning("⚠️ VIX adatok nem érhetők el, a VIX mutató nem lesz elérhető.")
 
+# Árfolyam oszlop keresése
 price_col = None
 for col in ['Adj Close', 'Close']:
     if col in spx.columns:
         price_col = col
         break
-
 if price_col is None:
     st.error("❌ Nem található 'Close' vagy 'Adj Close' oszlop az SPX adatok között.")
     st.stop()
 
-# On-Balance Volume számítása
-def calculate_obv(df, price_col):
+# OBV kézi számítása
+def calc_obv(df):
     obv = [0]
     for i in range(1, len(df)):
         if df[price_col].iloc[i] > df[price_col].iloc[i-1]:
@@ -68,16 +72,28 @@ try:
     stoch = ta.momentum.StochasticOscillator(spx['High'], spx['Low'], spx[price_col])
     spx['Stoch'] = stoch.stoch()
 
-    spx['OBV'] = calculate_obv(spx, price_col)
+    spx['OBV'] = calc_obv(spx)
 except Exception as e:
     st.error(f"Hiba az indikátorok számításakor: {e}")
     st.stop()
 
-# VIX alapján vételi/eladási jelzés (score)
-vix_value = vix['Close'].iloc[-1] if not vix.empty else None
+# 8 faktoros scoring
 
-# OBV trend vizsgálata (egyszerű lineáris trend)
-obv_trend = (spx['OBV'].iloc[-1] - spx['OBV'].iloc[-15]) > 0  # utolsó 15 nap emelkedett-e az OBV
+def vix_score(vix_value):
+    if vix_value > 20:
+        return 1  # Eladási jelzés
+    elif vix_value < 15:
+        return 0  # Vételi jelzés
+    else:
+        return 0  # Semleges
+
+# OBV trend (egyszerűen az OBV növekvő vagy csökkenő)
+spx['OBV_diff'] = spx['OBV'].diff()
+spx['OBV_Score'] = (spx['OBV_diff'] > 0).astype(int)
+
+# VIX score illesztése SPX indexhez (összehangoljuk dátummal)
+spx = spx.merge(vix[['Close']], left_index=True, right_index=True, how='left', suffixes=('', '_VIX'))
+spx['VIX_Score'] = spx['Close_VIX'].apply(vix_score).fillna(0).astype(int)
 
 spx['Buy_Score'] = (
     ((spx['RSI'] < 30).astype(int)) +
@@ -86,8 +102,8 @@ spx['Buy_Score'] = (
     ((spx['SMA50'] > spx['SMA200']).astype(int)) +
     ((spx[price_col] < spx['BB_lower']).astype(int)) +
     ((spx['Stoch'] < 20).astype(int)) +
-    (obv_trend.astype(int)) +
-    ((vix_value is not None and vix_value < 15).astype(int) if vix_value is not None else 0)
+    spx['OBV_Score'] +
+    (spx['VIX_Score'] == 0).astype(int)  # VIX alacsony = vétel
 )
 
 spx['Sell_Score'] = (
@@ -97,27 +113,75 @@ spx['Sell_Score'] = (
     ((spx['SMA50'] < spx['SMA200']).astype(int)) +
     ((spx[price_col] > spx['BB_upper']).astype(int)) +
     ((spx['Stoch'] > 80).astype(int)) +
-    ((~obv_trend).astype(int)) +
-    ((vix_value is not None and vix_value > 20).astype(int) if vix_value is not None else 0)
+    (spx['OBV_Score'] == 0).astype(int) +  # OBV csökken = eladás
+    spx['VIX_Score']  # VIX magas = eladás
 )
 
-# Indikátor magyarázatok tooltipként
+# Tooltip-es indikátor magyarázatok
 indicators = {
-    "RSI": "Relative Strength Index: jelzi a túlvett vagy túladott állapotot (RSI<30 vétel, RSI>70 eladás).",
-    "Drawdown": "Az árfolyam visszaesése a legmagasabb értékhez képest, nagy visszaesés vételi lehetőség.",
-    "MACD": "Két mozgóátlag konvergenciája és divergenciája, trendfordulók jelzésére.",
-    "SMA Golden Cross": "50 napos mozgóátlag metszi a 200 napost – vételi vagy eladási jelzés.",
-    "Bollinger Bands": "Az árfolyam volatilitásának mutatója, szélsőséges értékek vételi vagy eladási jelzések.",
-    "Stochastic Oscillator": "Árfolyam helyzete a múltbeli árakhoz képest, túladottság vagy túlvétel jelzésére.",
-    "OBV": "On-Balance Volume: árfolyam és forgalom összefüggése, trend megerősítésére.",
-    "VIX": "Volatilitás index, a piaci félelem szintjét mutatja (VIX>20 eladás, VIX<15 vétel)."
+    "RSI": "Relatív erősség index – túlvettség vagy túladottság jelző",
+    "Drawdown": "Maximális visszaesés az árfolyamban",
+    "VIX": "Volatilitási index – piaci félelem mutatója",
+    "MACD": "Mozgóátlag konvergencia divergencia – trend és momentum indikátor",
+    "SMA50/SMA200": "50 és 200 napos egyszerű mozgóátlag – aranykereszt és halálkereszt jelek",
+    "Stochastic Oscillator": "Túlvett és túladott zónák az árfolyam sebességén alapulva",
+    "Bollinger Bands": "Árfolyam volatilitás és szélsőségek jelzése",
+    "OBV": "On-Balance Volume – volumenváltozások és trend összefüggései"
 }
 
-st.subheader("Indikátorok magyarázata")
-for name, desc in indicators.items():
-    st.write(f"**{name}**", "ℹ️", help=desc)
+st.subheader("📊 Indikátorok magyarázata (hover az elnevezésen)")
 
-# Grafikonok
+for name, desc in indicators.items():
+    st.markdown(f'''
+    <p style="display:inline-block; border-bottom:1px dotted black; cursor: help; margin-right: 15px;" title="{desc}"><b>{name}</b></p>
+    ''', unsafe_allow_html=True)
+
+# RSI chart színezéssel
+def plot_rsi(df):
+    base = alt.Chart(df.reset_index()).encode(x='Date:T')
+
+    rsi_line = base.mark_line(color='blue').encode(y='RSI:Q')
+
+    # Háttér színezés túlvettség és túladottság zónákhoz
+    overbought = alt.Chart(df.reset_index()).mark_rect(opacity=0.15, color='red').encode(
+        y='RSI:Q',
+        y2=alt.value(70)
+    ).transform_filter(alt.datum.RSI > 70)
+
+    oversold = alt.Chart(df.reset_index()).mark_rect(opacity=0.15, color='green').encode(
+        y=alt.value(30),
+        y2='RSI:Q'
+    ).transform_filter(alt.datum.RSI < 30)
+
+    # De mivel mark_rect nehéz így megoldani így másképp: rajzoljuk a backgroundot egy sávval
+
+    rsi_chart = alt.Chart(df.reset_index()).mark_line(color='blue').encode(
+        x='Date:T',
+        y='RSI:Q',
+    )
+
+    band = alt.Chart(pd.DataFrame({
+        'y0': [70], 'y1': [100], 'color': ['red']
+    })).mark_rect(opacity=0.1).encode(
+        y='y0:Q',
+        y2='y1:Q',
+        color=alt.value('red')
+    )
+
+    band2 = alt.Chart(pd.DataFrame({
+        'y0': [0], 'y1': [30], 'color': ['green']
+    })).mark_rect(opacity=0.1).encode(
+        y='y0:Q',
+        y2='y1:Q',
+        color=alt.value('green')
+    )
+
+    rsi_chart = alt.layer(band, band2, rsi_line).encode(x='Date:T', y='RSI:Q').properties(height=200)
+
+    return rsi_chart
+
+st.subheader("📈 RSI Chart (túlvettség/túladottság háttérszínnel)")
+st.altair_chart(plot_rsi(spx), use_container_width=True)
 
 st.subheader("📉 SPX Árfolyam")
 st.line_chart(spx[price_col])
@@ -125,16 +189,11 @@ st.line_chart(spx[price_col])
 st.subheader("📉 Drawdown")
 st.area_chart(spx['Drawdown'])
 
-st.subheader("📈 RSI")
-rsi_chart = alt.Chart(spx.reset_index()).mark_line().encode(
-    x='Date:T',
-    y='RSI:Q',
-    tooltip=['Date:T', 'RSI:Q']
-).properties(height=150)
-rsi_rule_30 = alt.Chart(pd.DataFrame({'y':[30]})).mark_rule(color='green', strokeDash=[4,4]).encode(y='y')
-rsi_rule_70 = alt.Chart(pd.DataFrame({'y':[70]})).mark_rule(color='red', strokeDash=[4,4]).encode(y='y')
-
-st.altair_chart(rsi_chart + rsi_rule_30 + rsi_rule_70, use_container_width=True)
+st.subheader("📉 VIX Index")
+if not vix.empty:
+    st.line_chart(vix['Close'])
+else:
+    st.write("VIX adat nem elérhető.")
 
 st.subheader("📊 Buy & Sell Score (0-8)")
 
@@ -143,23 +202,14 @@ df_scores = df_scores.melt(id_vars='Date', value_vars=['Buy_Score', 'Sell_Score'
 
 color_scale = alt.Scale(domain=['Buy_Score', 'Sell_Score'], range=['green', 'red'])
 
-score_chart = alt.Chart(df_scores).mark_line().encode(
+chart = alt.Chart(df_scores).mark_line().encode(
     x='Date:T',
     y='Score:Q',
     color=alt.Color('Signal:N', scale=color_scale),
     tooltip=['Date:T', 'Signal:N', 'Score:Q']
 ).interactive()
 
-st.altair_chart(score_chart, use_container_width=True)
-
-# OBV chart külön
-st.subheader("📈 On-Balance Volume (OBV)")
-st.line_chart(spx['OBV'])
-
-# VIX chart külön (ha van adat)
-if not vix.empty:
-    st.subheader("📈 VIX (Volatilitás Index)")
-    st.line_chart(vix['Close'])
+st.altair_chart(chart, use_container_width=True)
 
 st.subheader("📊 Részletes adatok (utolsó 30 sor)")
 st.dataframe(spx.tail(30))
