@@ -25,6 +25,7 @@ def fetch_data(ticker, period="6mo", interval="1d"):
 # Adatok letöltése
 spx = fetch_data("^GSPC")
 vix = fetch_data("^VIX")
+eu50 = fetch_data("^STOXX50E")
 
 if spx.empty:
     st.error("❌ SPX adatok nem érhetők el.")
@@ -78,20 +79,17 @@ except Exception as e:
     st.stop()
 
 # 8 faktoros scoring
-
 def vix_score(vix_value):
     if vix_value > 20:
-        return 1  # Eladási jelzés
+        return 1
     elif vix_value < 15:
-        return 0  # Vételi jelzés
+        return 0
     else:
-        return 0  # Semleges
+        return 0
 
-# OBV trend (egyszerűen az OBV növekvő vagy csökkenő)
 spx['OBV_diff'] = spx['OBV'].diff()
 spx['OBV_Score'] = (spx['OBV_diff'] > 0).astype(int)
 
-# VIX score illesztése SPX indexhez (összehangoljuk dátummal)
 spx = spx.merge(vix[['Close']], left_index=True, right_index=True, how='left', suffixes=('', '_VIX'))
 spx['VIX_Score'] = spx['Close_VIX'].apply(vix_score).fillna(0).astype(int)
 
@@ -103,7 +101,7 @@ spx['Buy_Score'] = (
     ((spx[price_col] < spx['BB_lower']).astype(int)) +
     ((spx['Stoch'] < 20).astype(int)) +
     spx['OBV_Score'] +
-    (spx['VIX_Score'] == 0).astype(int)  # VIX alacsony = vétel
+    (spx['VIX_Score'] == 0).astype(int)
 )
 
 spx['Sell_Score'] = (
@@ -113,11 +111,11 @@ spx['Sell_Score'] = (
     ((spx['SMA50'] < spx['SMA200']).astype(int)) +
     ((spx[price_col] > spx['BB_upper']).astype(int)) +
     ((spx['Stoch'] > 80).astype(int)) +
-    (spx['OBV_Score'] == 0).astype(int) +  # OBV csökken = eladás
-    spx['VIX_Score']  # VIX magas = eladás
+    (spx['OBV_Score'] == 0).astype(int) +
+    spx['VIX_Score']
 )
 
-# Tooltip-es indikátor magyarázatok
+# Tooltip-ek
 indicators = {
     "RSI": "Relatív erősség index – túlvettség vagy túladottság jelző",
     "Drawdown": "Maximális visszaesés az árfolyamban",
@@ -130,58 +128,32 @@ indicators = {
 }
 
 st.subheader("📊 Indikátorok magyarázata (hover az elnevezésen)")
-
 for name, desc in indicators.items():
     st.markdown(f'''
     <p style="display:inline-block; border-bottom:1px dotted black; cursor: help; margin-right: 15px;" title="{desc}"><b>{name}</b></p>
     ''', unsafe_allow_html=True)
 
-# RSI chart színezéssel
+# RSI chart
 def plot_rsi(df):
     base = alt.Chart(df.reset_index()).encode(x='Date:T')
-
     rsi_line = base.mark_line(color='blue').encode(y='RSI:Q')
-
-    # Háttér színezés túlvettség és túladottság zónákhoz
-    overbought = alt.Chart(df.reset_index()).mark_rect(opacity=0.15, color='red').encode(
-        y='RSI:Q',
-        y2=alt.value(70)
-    ).transform_filter(alt.datum.RSI > 70)
-
-    oversold = alt.Chart(df.reset_index()).mark_rect(opacity=0.15, color='green').encode(
-        y=alt.value(30),
-        y2='RSI:Q'
-    ).transform_filter(alt.datum.RSI < 30)
-
-    # De mivel mark_rect nehéz így megoldani így másképp: rajzoljuk a backgroundot egy sávval
-
-    rsi_chart = alt.Chart(df.reset_index()).mark_line(color='blue').encode(
-        x='Date:T',
-        y='RSI:Q',
-    )
-
-    band = alt.Chart(pd.DataFrame({
-        'y0': [70], 'y1': [100], 'color': ['red']
-    })).mark_rect(opacity=0.1).encode(
-        y='y0:Q',
-        y2='y1:Q',
-        color=alt.value('red')
-    )
-
-    band2 = alt.Chart(pd.DataFrame({
-        'y0': [0], 'y1': [30], 'color': ['green']
-    })).mark_rect(opacity=0.1).encode(
-        y='y0:Q',
-        y2='y1:Q',
-        color=alt.value('green')
-    )
-
-    rsi_chart = alt.layer(band, band2, rsi_line).encode(x='Date:T', y='RSI:Q').properties(height=200)
-
-    return rsi_chart
+    band = alt.Chart(pd.DataFrame({'y0': [70], 'y1': [100]})).mark_rect(opacity=0.1).encode(y='y0:Q', y2='y1:Q', color=alt.value('red'))
+    band2 = alt.Chart(pd.DataFrame({'y0': [0], 'y1': [30]})).mark_rect(opacity=0.1).encode(y='y0:Q', y2='y1:Q', color=alt.value('green'))
+    return alt.layer(band, band2, rsi_line).encode(x='Date:T', y='RSI:Q').properties(height=200)
 
 st.subheader("📈 RSI Chart (túlvettség/túladottság háttérszínnel)")
 st.altair_chart(plot_rsi(spx), use_container_width=True)
+
+st.subheader("📈 SPX vs EU50 Árfolyam összehasonlítás")
+if not eu50.empty:
+    compare_df = pd.DataFrame({
+        'SPX': spx[price_col],
+        'EU50': eu50[price_col]
+    }).dropna()
+    compare_df = compare_df / compare_df.iloc[0] * 100
+    st.line_chart(compare_df)
+else:
+    st.write("EU50 árfolyamadat nem elérhető.")
 
 st.subheader("📉 SPX Árfolyam")
 st.line_chart(spx[price_col])
@@ -196,12 +168,10 @@ else:
     st.write("VIX adat nem elérhető.")
 
 st.subheader("📊 Buy & Sell Score (0-8)")
-
 df_scores = spx.reset_index()[['Date', 'Buy_Score', 'Sell_Score']]
 df_scores = df_scores.melt(id_vars='Date', value_vars=['Buy_Score', 'Sell_Score'], var_name='Signal', value_name='Score')
 
 color_scale = alt.Scale(domain=['Buy_Score', 'Sell_Score'], range=['green', 'red'])
-
 chart = alt.Chart(df_scores).mark_line().encode(
     x='Date:T',
     y='Score:Q',
